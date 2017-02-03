@@ -643,6 +643,56 @@ struct vy_index {
 	uint64_t column_mask;
 };
 
+/**
+ * Check if the tuple has the column mask of an UPDATE operation.
+ * @param tuple               Vinyl tuple.
+ * @param format_with_colmask Format of an space for tuples with
+ *                            column mask.
+ */
+static inline bool
+vy_tuple_has_column_mask(const struct tuple *tuple,
+			 const struct tuple_format *format_with_colmask)
+{
+#ifndef NDEBUG
+	enum iproto_type type = vy_stmt_type(tuple);
+	assert(type == IPROTO_REPLACE || type == IPROTO_DELETE);
+#endif
+	return tuple->format_id == format_with_colmask->id;
+}
+
+/**
+ * Set the column mask in the tuple.
+ * @param tuple               Tuple to set column mask.
+ * @param format_with_colmask Format of an space for tuples with
+ *                            column mask.
+ * @param column_mask         Bitmask of the updated columns.
+ */
+inline void
+vy_tuple_set_column_mask(struct tuple *tuple,
+			 const struct tuple_format *format_with_colmask,
+			 uint64_t column_mask)
+{
+	assert(vy_tuple_has_column_mask(tuple, format_with_colmask));
+#ifndef NDEBUG
+	enum iproto_type type = vy_stmt_type(tuple);
+	assert(type == IPROTO_REPLACE || type == IPROTO_DELETE);
+#endif
+	char *meta = ((char *) tuple + tuple->data_offset -
+		      format_with_colmask->tuple_meta_size);
+	*((uint64_t *) meta) = column_mask;
+}
+
+/** Get the column mask of the specified tuple. */
+inline uint64_t
+vy_tuple_column_mask(const struct tuple *tuple)
+{
+#ifndef NDEBUG
+	enum iproto_type type = vy_stmt_type(tuple);
+	assert(type == IPROTO_REPLACE || type == IPROTO_DELETE);
+#endif
+	return *((const uint64_t *) tuple_meta(tuple));
+}
+
 /** @sa implementation for details. */
 extern struct vy_index *
 vy_index(struct Index *index);
@@ -5199,11 +5249,12 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 	if (index->surrogate_format == NULL)
 		goto fail_format;
 	tuple_format_ref(index->surrogate_format, 1);
-
-	index->format_with_colmask = vy_create_format_with_mask(space->format);
-	if (index->format_with_colmask == NULL)
-		goto fail_format_with_mask;
-	tuple_format_ref(index->format_with_colmask, 1);
+	if (user_key_def->iid == 0) {
+		index->format_with_colmask = vy_create_format_with_mask(space->format);
+		if (index->format_with_colmask == NULL)
+			goto fail_format_with_mask;
+		tuple_format_ref(index->format_with_colmask, 1);
+	}
 
 	if (vy_index_conf_create(index, index->key_def))
 		goto fail_conf;
@@ -5212,7 +5263,7 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 	if (index->run_hist == NULL)
 		goto fail_run_hist;
 
-	if (index->key_def->iid > 0) {
+	if (user_key_def->iid > 0) {
 		/**
 		 * Calculate the bitmask of columns used in this
 		 * index.
@@ -5248,11 +5299,12 @@ fail_run_hist:
 	free(index->name);
 	free(index->path);
 fail_format_with_mask:
-	tuple_format_ref(index->format_with_colmask, -1);
+	if (user_key_def->iid == 0)
+		tuple_format_ref(index->format_with_colmask, -1);
 fail_conf:
 	tuple_format_ref(index->surrogate_format, -1);
 fail_format:
-	if (index->key_def->iid > 0)
+	if (user_key_def->iid > 0)
 		key_def_delete(index->key_def);
 fail_key_def:
 	key_def_delete(user_key_def);
@@ -5270,14 +5322,16 @@ vy_commit_alter_space(struct space *old_space, struct space *new_space)
 		index = vy_index(new_space->index[i]);
 		index->space = new_space;
 		tuple_format_ref(index->space_format, -1);
-		tuple_format_ref(index->format_with_colmask, -1);
 		index->space_format = new_space->format;
-		index->format_with_colmask =
-			vy_create_format_with_mask(new_space->format);
-		if (index->format_with_colmask == NULL)
-			return -1;
 		tuple_format_ref(index->space_format, 1);
-		tuple_format_ref(index->format_with_colmask, 1);
+		if (i == 0) {
+			tuple_format_ref(index->format_with_colmask, -1);
+			index->format_with_colmask =
+				vy_create_format_with_mask(new_space->format);
+			if (index->format_with_colmask == NULL)
+				return -1;
+			tuple_format_ref(index->format_with_colmask, 1);
+		}
 	}
 	return 0;
 }
@@ -5291,6 +5345,8 @@ vy_index_delete(struct vy_index *index)
 	free(index->path);
 	tuple_format_ref(index->surrogate_format, -1);
 	tuple_format_ref(index->space_format, -1);
+	if (index->key_def->iid == 0)
+		tuple_format_ref(index->format_with_colmask, -1);
 	if (index->key_def->iid > 0)
 		key_def_delete(index->key_def);
 	key_def_delete(index->user_key_def);
@@ -6147,6 +6203,24 @@ vy_can_skip_update(const struct vy_index *idx, uint64_t column_mask)
 	 */
 	assert(idx->key_def->iid > 0);
 	return (column_mask & idx->column_mask) == 0;
+}
+
+/**
+ * Check if an UPDATE operation with the specified column mask
+ * changes all indexes. In that case we don't need to store
+ * column mask in a tuple.
+ * @param space Space to update.
+ * @param column_mask Bitmask of update operations.
+ */
+inline bool
+vy_update_changes_all_indexes(const struct space *space, uint64_t column_mask)
+{
+	for (uint32_t i = 0; i < space->index_count; ++i) {
+		struct vy_index *index = vy_index(space->index[i]);
+		if (vy_can_skip_update(index, column_mask))
+			return false;
+	}
+	return true;
 }
 
 int
