@@ -179,7 +179,6 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt);
  * Insert a statement into the in-memory level.
  *
  * @param mem        vy_mem.
- * @param mem_format Format of the mem statements.
  * @param stmt       Vinyl statement.
  * @param alloc_lsn  LSN for lsregion allocator.
  *
@@ -187,8 +186,7 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt);
  * @retval -1 Memory error.
  */
 int
-vy_mem_insert(struct vy_mem *mem, struct tuple_format *mem_format,
-	      const struct tuple *stmt, int64_t alloc_lsn);
+vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn);
 
 /**
  * Iterator for in-memory level.

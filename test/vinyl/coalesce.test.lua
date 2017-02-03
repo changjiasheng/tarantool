@@ -1,3 +1,4 @@
+collectgarbage('collect')
 test_run = require('test_run').new()
 
 fiber = require('fiber')
@@ -58,5 +59,7 @@ vyinfo().range_count
 
 -- Check the remaining keys.
 for k = 1,key_count do v = s:get(k) assert(v == nil or v[2] == k + iter) end
+
+collectgarbage('collect')
 
 s:drop()
