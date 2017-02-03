@@ -1,10 +1,13 @@
 #!groovy
 
 stage('Preparation') {
-    dir("build") {
-        git 'https://github.com/tarantool/build.git'
+    node {
+        checkout scm
+        dir("build") {
+            git 'https://github.com/tarantool/build.git'
+        }
+        stash name: 'source', useDefaultExcludes: false
     }
-    stash name: 'source', useDefaultExcludes: false
 }
 
 
