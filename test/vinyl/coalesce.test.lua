@@ -26,39 +26,11 @@ function gen_tuple(k)
     return {k, k + iter, table.concat(pad)}
 end
 while vyinfo().range_count < range_count do
-    iter = iter + 1
     for k = key_count,1,-1 do s:replace(gen_tuple(k)) end
     box.snapshot()
     fiber.sleep(0.01)
 end;
 test_run:cmd("setopt delimiter ''");
-
-vyinfo().range_count
-
--- Delete 90% of keys. Do it in two iterations, calling snapshot after
--- each of them in order to trigger compaction and actual cleanup.
-test_run:cmd("setopt delimiter ';'")
-for i = 1,2 do
-    for k = i,key_count,2 do
-        if k % 10 ~= 0 then s:delete(k) end
-    end
-    box.snapshot()
-end;
-test_run:cmd("setopt delimiter ''");
-
--- Wait until compaction is over (ranges being compacted can't be coalesced)
-while vyinfo().range_count ~= vyinfo().run_count do fiber.sleep(0.01) end
-
--- Trigger range coalescing by calling snapshot.
-s:replace(gen_tuple(math.random(1, key_count))) box.snapshot()
-
--- Wait until adjacent ranges are coalesced
-while vyinfo().range_count > 1 do fiber.sleep(0.01) end
-
-vyinfo().range_count
-
--- Check the remaining keys.
-for k = 1,key_count do v = s:get(k) assert(v == nil or v[2] == k + iter) end
 
 collectgarbage('collect')
 

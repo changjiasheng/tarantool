@@ -189,6 +189,7 @@ tuple_format_alloc(struct rlist *key_list)
 void
 tuple_format_delete(struct tuple_format *format)
 {
+	assert(format->refs == 0);
 	tuple_format_deregister(format);
 	free(format);
 }

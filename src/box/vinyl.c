@@ -5246,8 +5246,10 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 
 	index->surrogate_format = tuple_format_new(&key_list, 0,
 						   &vy_tuple_format_vtab);
+	say_warn("%s(): surrogate_format created for space %d and index %d, id = %d", __func__, (int)user_key_def->space_id, (int)user_key_def->iid, (int)index->surrogate_format->id);
 	if (index->surrogate_format == NULL)
 		goto fail_format;
+	tuple_format_ref(index->surrogate_format, 1);
 	tuple_format_ref(index->surrogate_format, 1);
 	if (user_key_def->iid == 0) {
 		index->format_with_colmask = vy_create_format_with_mask(space->format);
@@ -5349,8 +5351,7 @@ vy_index_delete(struct vy_index *index)
 	free(index->path);
 	tuple_format_ref(index->surrogate_format, -1);
 	tuple_format_ref(index->space_format, -1);
-	if (index->key_def->iid == 0)
-		tuple_format_ref(index->format_with_colmask, -1);
+	tuple_format_ref(index->format_with_colmask, -1);
 	if (index->key_def->iid > 0)
 		key_def_delete(index->key_def);
 	key_def_delete(index->user_key_def);
