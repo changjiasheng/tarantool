@@ -609,7 +609,7 @@ struct vy_index {
 	 */
 	struct key_def *user_key_def;
 	/* A tuple format for key_def. */
-	struct tuple_format *format;
+	struct tuple_format *surrogate_format;
 	/**
 	 * Need special link on space->format, because there is
 	 * case when the space is deleted but its format still is
@@ -3178,6 +3178,7 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 	struct vy_range *range = arg->range;
 	struct key_def *key_def = index->key_def;
 	struct vy_run *run;
+	struct tuple_format *format = index->surrogate_format;
 
 	switch (record->type) {
 	case VY_LOG_CREATE_INDEX:
@@ -3189,13 +3190,13 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 		if (range == NULL)
 			return -1;
 		if (record->range_begin != NULL) {
-			range->begin = vy_key_from_msgpack(index->format,
+			range->begin = vy_key_from_msgpack(format,
 							   record->range_begin);
 			if (range->begin == NULL)
 				return -1;
 		}
 		if (record->range_end != NULL) {
-			range->end = vy_key_from_msgpack(index->format,
+			range->end = vy_key_from_msgpack(format,
 							 record->range_end);
 			if (range->end == NULL)
 				return -1;
@@ -3214,7 +3215,8 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 		run = vy_run_new(record->run_id);
 		if (run == NULL)
 			return -1;
-		if (vy_run_recover(run, index->path, index->format) != 0) {
+		if (vy_run_recover(run, index->path,
+				   index->surrogate_format) != 0) {
 			vy_run_delete(run);
 			return -1;
 		}
@@ -3271,7 +3273,7 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
 
 	bool was_empty = (mem->used == 0);
 
-	int rc = vy_mem_insert(mem, index->format, stmt, alloc_lsn);
+	int rc = vy_mem_insert(mem, index->surrogate_format, stmt, alloc_lsn);
 	if (rc != 0)
 		return -1;
 
@@ -5168,10 +5170,11 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 	rlist_create(&key_list);
 	rlist_add_entry(&key_list, index->key_def, link);
 
-	index->format = tuple_format_new(&key_list, 0, &vy_tuple_format_vtab);
-	if (index->format == NULL)
+	index->surrogate_format = tuple_format_new(&key_list, 0,
+						   &vy_tuple_format_vtab);
+	if (index->surrogate_format == NULL)
 		goto fail_format;
-	tuple_format_ref(index->format, 1);
+	tuple_format_ref(index->surrogate_format, 1);
 
 	if (vy_index_conf_create(index, index->key_def))
 		goto fail_conf;
@@ -5216,7 +5219,7 @@ fail_run_hist:
 	free(index->name);
 	free(index->path);
 fail_conf:
-	tuple_format_ref(index->format, -1);
+	tuple_format_ref(index->surrogate_format, -1);
 fail_format:
 	if (index->key_def->iid > 0)
 		key_def_delete(index->key_def);
@@ -5248,7 +5251,7 @@ vy_index_delete(struct vy_index *index)
 	vy_range_tree_iter(&index->tree, NULL, vy_range_tree_free_cb, index);
 	free(index->name);
 	free(index->path);
-	tuple_format_ref(index->format, -1);
+	tuple_format_ref(index->surrogate_format, -1);
 	tuple_format_ref(index->space_format, -1);
 	if (index->key_def->iid > 0)
 		key_def_delete(index->key_def);
@@ -5689,8 +5692,8 @@ vy_insert_secondary(struct vy_tx *tx, struct vy_index *index,
 		if (vy_check_dup_key(tx, index, key, part_count))
 			return -1;
 	}
-	struct tuple *tuple = vy_stmt_new_surrogate_replace(index->format,
-							    stmt);
+	struct tuple *tuple =
+		vy_stmt_new_surrogate_replace(index->surrogate_format, stmt);
 	if (tuple == NULL)
 		return -1;
 	int rc = vy_tx_set(tx, index, tuple);
@@ -5767,7 +5770,8 @@ vy_index_delete_stmt(struct vy_tx *tx, struct vy_index *index,
 		     const struct tuple *old)
 {
 	assert(tx == NULL || tx->state == VINYL_TX_READY);
-	struct tuple *key = vy_stmt_new_surrogate_delete(index->format, old);
+	struct tuple *key =
+		vy_stmt_new_surrogate_delete(index->surrogate_format, old);
 	if (key == NULL)
 		return -1;
 	int rc = vy_tx_set(tx, index, key);
@@ -6043,8 +6047,9 @@ vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 			return -1;
 	} else { /* Primary is the single index in the space. */
 		assert(index->key_def->iid == 0);
+		struct tuple_format *format = pk->surrogate_format;
 		struct tuple *delete =
-			vy_stmt_new_surrogate_delete_from_key(pk->format, key,
+			vy_stmt_new_surrogate_delete_from_key(format, key,
 							      pk->key_def);
 		if (delete == NULL)
 			return -1;
@@ -7261,8 +7266,8 @@ vy_run_iterator_read(struct vy_run_iterator *itr,
 	int rc = vy_run_iterator_load_page(itr, pos.page_no, &page);
 	if (rc != 0)
 		return rc;
-	*stmt = vy_page_stmt(page, pos.pos_in_page, itr->index->format,
-			     itr->index->key_def);
+	*stmt = vy_page_stmt(page, pos.pos_in_page,
+			     itr->index->surrogate_format, itr->index->key_def);
 	if (*stmt == NULL)
 		return -1;
 	return 0;
@@ -7322,7 +7327,8 @@ vy_run_iterator_search_in_page(struct vy_run_iterator *itr,
 	struct vy_index *idx = itr->index;
 	while (beg != end) {
 		uint32_t mid = beg + (end - beg) / 2;
-		struct tuple *fnd_key = vy_page_stmt(page, mid, idx->format,
+		struct tuple *fnd_key = vy_page_stmt(page, mid,
+						     idx->surrogate_format,
 						     itr->index->key_def);
 		if (fnd_key == NULL)
 			return end;
