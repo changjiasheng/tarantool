@@ -202,11 +202,29 @@ tuple_format_new(struct rlist *key_list, uint16_t extra_tuple_size,
 		return NULL;
 	format->vtab = *vtab;
 	format->tuple_meta_size = extra_tuple_size;
-	if (tuple_format_register(format) < 0) {
+	if (tuple_format_register(format) != 0) {
 		tuple_format_delete(format);
 		return NULL;
 	}
 	if (tuple_format_create(format, key_list) < 0) {
+		tuple_format_delete(format);
+		return NULL;
+	}
+	return format;
+}
+
+struct tuple_format *
+tuple_format_dup(const struct tuple_format *src)
+{
+	uint32_t total = sizeof(struct tuple_format) +
+			 src->field_count * sizeof(struct tuple_field_format);
+
+	struct tuple_format *format = (struct tuple_format *) malloc(total);
+	if (format == NULL)
+		return NULL;
+	memcpy(format, src, total);
+	format->id == FORMAT_ID_NIL;
+	if (tuple_format_register(format) != 0) {
 		tuple_format_delete(format);
 		return NULL;
 	}

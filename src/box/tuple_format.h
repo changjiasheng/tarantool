@@ -195,6 +195,16 @@ tuple_format_new(struct rlist *key_list, uint16_t extra_tuple_size,
 		 struct tuple_format_vtab *vtab);
 
 /**
+ * Register the duplicate of the specified format.
+ * @param src Original format.
+ *
+ * @retval not NULL Success.
+ * @retval     NULL Memory or format register error.
+ */
+struct tuple_format *
+tuple_format_dup(const struct tuple_format *src);
+
+/**
  * Fill the field map of tuple with field offsets.
  * @param format    Tuple format.
  * @param field_map A pointer behind the last element of the field
