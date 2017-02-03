@@ -32,8 +32,8 @@
 #include "user_def.h"
 #include "assoc.h"
 #include "schema.h"
-#include "space.h"
 #include "memtx_index.h"
+#include "space.h"
 #include "func.h"
 #include "index.h"
 #include "bit/bit.h"
@@ -132,8 +132,6 @@ user_map_iterator_next(struct user_map_iterator *it)
 
 /* {{{ privset_t - set of effective privileges of a user */
 
-extern "C" {
-
 static int
 priv_def_compare(const struct priv_def *lhs, const struct priv_def *rhs)
 {
@@ -143,8 +141,6 @@ priv_def_compare(const struct priv_def *lhs, const struct priv_def *rhs)
 		return lhs->object_id > rhs->object_id ? 1 : -1;
 	return 0;
 }
-
-} /* extern "C" */
 
 rb_gen(, privset_, privset_t, struct priv_def, link, priv_def_compare);
 
@@ -178,18 +174,24 @@ user_destroy(struct user *user)
  * Add a privilege definition to the list
  * of effective privileges of a user.
  */
-void
+int
 user_grant_priv(struct user *user, struct priv_def *def)
 {
 	struct priv_def *old = privset_search(&user->privs, def);
 	if (old == NULL) {
 		old = (struct priv_def *)
-			region_alloc_xc(&user->pool, sizeof(struct priv_def));
+			region_alloc(&user->pool, sizeof(struct priv_def));
+		if (old == NULL) {
+			diag_set(OutOfMemory, sizeof(struct priv_def), "region",
+				 "new slab");
+			return -1;
+		}
 		*old = *def;
 		privset_insert(&user->privs, old);
 	} else {
 		old->access |= def->access;
 	}
+	return 0;
 }
 
 /**
@@ -231,10 +233,12 @@ access_find(struct priv_def *priv)
  * Reset effective access of the user in the
  * corresponding objects.
  */
-static void
+static int
 user_set_effective_access(struct user *user)
 {
 	struct credentials *cr = current_user();
+	if (cr == NULL)
+		return -1;
 	struct priv_def *priv;
 	for (priv = privset_first(&user->privs);
 	     priv;
@@ -251,16 +255,17 @@ user_set_effective_access(struct user *user)
 			cr->universal_access = access->effective;
 		}
 	}
+	return 0;
 }
 
 /**
  * Reload user privileges and re-grant them.
  */
-static void
+static int
 user_reload_privs(struct user *user)
 {
 	if (user->is_dirty == false)
-		return;
+		return 0;
 	struct priv_def *priv;
 	/**
 	 * Reset effective access of the user in the
@@ -272,17 +277,19 @@ user_reload_privs(struct user *user)
 	     priv = privset_next(&user->privs, priv)) {
 		priv->access = 0;
 	}
-	user_set_effective_access(user);
+	if (user_set_effective_access(user) == -1) {
+		return -1;
+	}
 	region_free(&user->pool);
 	privset_new(&user->privs);
 	/* Load granted privs from _priv space. */
-	{
+	try {
 		struct space *space = space_cache_find(BOX_PRIV_ID);
-		char key[6];
 		/** Primary key - by user id */
-		MemtxIndex *index = index_find_system(space, 0);
+		char key[6];
 		mp_encode_uint(key, user->def.uid);
 
+		MemtxIndex *index = index_find_system(space, 0);
 		struct iterator *it = index->position();
 		index->initIterator(it, ITER_EQ, key, 1);
 
@@ -291,13 +298,48 @@ user_reload_privs(struct user *user)
 			struct priv_def priv;
 			priv_def_create_from_tuple(&priv, tuple);
 			/**
-			 * Skip role grants, we're only
-			 * interested in real objects.
-			 */
+			* Skip role grants, we're only
+			* interested in real objects.
+			*/
 			if (priv.object_type != SC_ROLE)
 				user_grant_priv(user, &priv);
 		}
+	} catch (Exception *) {
+		return -1;
 	}
+/*
+	{
+		char key[7], *key_end;
+		key_end = mp_encode_array(key, 1);
+		key_end = mp_encode_uint (key_end, user->def.uid);
+
+		box_iterator_t *it = box_index_iterator(BOX_PRIV_ID, 0, ITER_EQ,
+							key, key_end);
+		if (it == NULL)
+			return -1;
+		struct tuple *tuple;
+		while (true) {
+			if (box_iterator_next(it, &tuple) == -1) {
+				box_iterator_free(it);
+				return -1;
+			}
+			if (tuple == NULL)
+				break;
+			struct priv_def priv;
+			priv_def_create_from_tuple(&priv, tuple);
+			//
+			// Skip role grants, we're only
+			// interested in real objects.
+			//
+			if (priv.object_type != SC_ROLE)
+				if (user_grant_priv(user, &priv) == -1) {
+					box_iterator_free(it);
+					return -1;
+				}
+		}
+		box_iterator_free(it);
+	}
+*/
 	{
 		/* Take into account privs granted through roles. */
 		struct user_map_iterator it;
@@ -306,13 +348,17 @@ user_reload_privs(struct user *user)
 		while ((role = user_map_iterator_next(&it))) {
 			struct priv_def *def = privset_first(&role->privs);
 			while (def) {
-				user_grant_priv(user, def);
+				if (user_grant_priv(user, def) == -1)
+					return -1;
 				def = privset_next(&role->privs, def);
 			}
 		}
 	}
-	user_set_effective_access(user);
+	if (user_set_effective_access(user) == -1) {
+		return -1;
+	}
 	user->is_dirty = false;
+	return 0;
 }
 
 /** }}} */
@@ -332,8 +378,8 @@ static int min_token_idx = 0;
  * Raise an exception when the maximal number of users
  * is reached (and we're out of tokens).
  */
-uint8_t
-auth_token_get()
+int
+auth_token_get(uint8_t *auth_token)
 {
 	uint8_t bit_no = 0;
 	while (min_token_idx < USER_MAP_SIZE) {
@@ -347,7 +393,9 @@ auth_token_get()
 		 * Check for BOX_USER_MAX to cover case when
 		 * USER_MAP_BITS > BOX_USER_MAX.
 		 */
-		tnt_raise(LoggedError, ER_USER_MAX, BOX_USER_MAX);
+		diag_set(ClientError, ER_USER_MAX, BOX_USER_MAX);
+		error_log(diag_last_error(diag_get()));
+		return -1;
 	}
         /*
          * find-first-set returns bit index starting from 1,
@@ -355,9 +403,9 @@ auth_token_get()
          */
 	bit_no--;
 	tokens[min_token_idx] ^= ((umap_int_t) 1) << bit_no;
-	int auth_token = min_token_idx * UMAP_INT_BITS + bit_no;
-	assert(auth_token < UINT8_MAX);
-	return auth_token;
+	*auth_token = min_token_idx * UMAP_INT_BITS + bit_no;
+	assert(*auth_token < UINT8_MAX);
+	return 0;
 }
 
 /**
@@ -383,7 +431,9 @@ user_cache_replace(struct user_def *def)
 {
 	struct user *user = user_by_id(def->uid);
 	if (user == NULL) {
-		uint8_t auth_token = auth_token_get();
+		uint8_t auth_token = 0;
+		if (auth_token_get(&auth_token) == -1)
+			return NULL;
 		user = users + auth_token;
 		user_create(user, auth_token);
 		struct mh_i32ptr_node_t node = { def->uid, user };
@@ -436,7 +486,9 @@ user_find(uint32_t uid)
 struct user *
 user_find_by_name(const char *name, uint32_t len)
 {
-	uint32_t uid = schema_find_id(BOX_USER_ID, 2, name, len);
+	uint32_t uid = 0;
+	if (schema_find_id(BOX_USER_ID, 2, name, len, &uid) == -1)
+		return NULL;
 	struct user *user = user_by_id(uid);
 	if (user == NULL || user->def.type != SC_USER) {
 		char name_buf[BOX_NAME_MAX + 1];
@@ -448,7 +500,7 @@ user_find_by_name(const char *name, uint32_t len)
 	return user;
 }
 
-void
+int
 user_cache_init()
 {
 	/** Mark all tokens as unused. */
@@ -468,6 +520,8 @@ user_cache_init()
 	def.owner = ADMIN;
 	def.type = SC_USER;
 	struct user *user = user_cache_replace(&def);
+	if (user == NULL)
+		return -1;
 	/* 0 is the auth token and user id by default. */
 	assert(user->def.uid == GUEST && user->auth_token == GUEST);
 	(void)user;
@@ -477,8 +531,11 @@ user_cache_init()
 	def.uid = def.owner = ADMIN;
 	def.type = SC_USER;
 	user = user_cache_replace(&def);
+	if (user == NULL)
+		return -1;
 	/* ADMIN is both the auth token and user id for 'admin' user. */
 	assert(user->def.uid == ADMIN && user->auth_token == ADMIN);
+	return 0;
 }
 
 void
@@ -492,7 +549,7 @@ user_cache_free()
 
 /** {{{ roles */
 
-void
+int
 role_check(struct user *grantee, struct user *role)
 {
 	/*
@@ -525,16 +582,18 @@ role_check(struct user *grantee, struct user *role)
 	 */
 	if (user_map_is_set(&transitive_closure,
 			    role->auth_token)) {
-		tnt_raise(ClientError, ER_ROLE_LOOP,
-			  role->def.name, grantee->def.name);
+		diag_set(ClientError, ER_ROLE_LOOP,
+			 role->def.name, grantee->def.name);
+		return -1;
 	}
+	return 0;
 }
 
 /**
  * Re-calculate effective grants of the linked subgraph
  * this user/role is a part of.
  */
-void
+int
 rebuild_effective_grants(struct user *grantee)
 {
 	/*
@@ -586,7 +645,8 @@ rebuild_effective_grants(struct user *grantee)
 			struct user_map indirect_edges = user->roles;
 			user_map_minus(&indirect_edges, &transitive_closure);
 			if (user_map_is_empty(&indirect_edges)) {
-				user_reload_privs(user);
+				if (user_reload_privs(user) == -1)
+					return -1;
 				user_map_union(&next_layer, &user->users);
 			} else {
 				/*
@@ -607,6 +667,7 @@ rebuild_effective_grants(struct user *grantee)
 		user_map_union(&transitive_closure, &current_layer);
 		current_layer = next_layer;
 	}
+	return 0;
 }
 
 
@@ -615,36 +676,36 @@ rebuild_effective_grants(struct user *grantee)
  * Grant all effective privileges of the role to whoever
  * this role was granted to.
  */
-void
+int
 role_grant(struct user *grantee, struct user *role)
 {
 	user_map_set(&role->users, grantee->auth_token);
 	user_map_set(&grantee->roles, role->auth_token);
-	rebuild_effective_grants(grantee);
+	return rebuild_effective_grants(grantee);
 }
 
 /**
  * Update the role dependencies graph.
  * Rebuild effective privileges of the grantee.
  */
-void
+int
 role_revoke(struct user *grantee, struct user *role)
 {
 	user_map_clear(&role->users, grantee->auth_token);
 	user_map_clear(&grantee->roles, role->auth_token);
-	rebuild_effective_grants(grantee);
+	return rebuild_effective_grants(grantee);
 }
 
-void
+int
 priv_grant(struct user *grantee, struct priv_def *priv)
 {
 	struct access *object = access_find(priv);
 	if (object == NULL)
-		return;
+		return 0;
 	struct access *access = &object[grantee->auth_token];
 	assert(privset_search(&grantee->privs, priv) || access->granted == 0);
 	access->granted = priv->access;
-	rebuild_effective_grants(grantee);
+	return rebuild_effective_grants(grantee);
 }
 
 /** }}} */

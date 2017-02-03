@@ -882,7 +882,7 @@ static inline struct func *
 access_check_func(const char *name, uint32_t name_len)
 {
 	struct func *func = func_by_name(name, name_len);
-	struct credentials *credentials = current_user();
+	struct credentials *credentials = current_user_xc();
 	/*
 	 * If the user has universal access, don't bother with checks.
 	 * No special check for ADMIN user is necessary
@@ -993,7 +993,7 @@ box_process_call(struct request *request, struct obuf *out)
 	 */
 	struct credentials *orig_credentials = NULL;
 	if (func && func->def.setuid) {
-		orig_credentials = current_user();
+		orig_credentials = current_user_xc();
 		/* Remember and change the current user id. */
 		if (func->owner_credentials.auth_token >= BOX_USER_MAX) {
 			/*
@@ -1455,7 +1455,8 @@ box_init(void)
 	engine_init();
 
 	schema_init();
-	user_cache_init();
+	if (user_cache_init() == -1)
+		diag_raise();
 	/*
 	 * The order is important: to initialize sessions,
 	 * we need to access the admin user, which is used

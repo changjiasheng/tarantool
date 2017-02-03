@@ -82,6 +82,65 @@ struct session {
 };
 
 /**
+ * Create a session.
+ * Invokes a Lua trigger box.session.on_connect if it is
+ * defined. Issues a new session identifier.
+ * Must called by the networking layer
+ * when a new connection is established.
+ *
+ * @return handle for a created session
+ * @exception tnt_Exception or lua error if session
+ * trigger fails or runs out of resources.
+ */
+struct session *
+session_create(int fd);
+
+/**
+ * Create a new session on demand, and set fiber on_stop
+ * trigger to destroy it when this fiber ends.
+ */
+struct session *
+session_create_on_demand();
+/*
+ * Return the current user. Create it if it doesn't
+ * exist yet.
+ * The same rationale for initializing the current
+ * user on demand as in current_session() applies.
+ */
+
+static inline struct credentials *
+current_user()
+{
+	struct credentials *u =
+		(struct credentials *) fiber_get_key(fiber(), FIBER_KEY_USER);
+	if (u == NULL) {
+		if (session_create_on_demand() == NULL)
+			return NULL;
+		u = (struct credentials *) fiber_get_key(fiber(),
+							  FIBER_KEY_USER);
+	}
+	return u;
+}
+
+/*
+ * When creating a new fiber, the database (box)
+ * may not be initialized yet. When later on
+ * this fiber attempts to access the database,
+ * we have no other choice but initialize fiber-specific
+ * database state (something like a database connection)
+ * on demand. This is why this function needs to
+ * check whether or not the current session exists
+ * and create it otherwise.
+ */
+static inline struct session *
+current_session()
+{
+	struct session *s = (struct session *)
+		fiber_get_key(fiber(), FIBER_KEY_SESSION);
+	return s ? s : session_create_on_demand();
+}
+
+/**
  * Find a session by id.
  */
 struct session *
@@ -125,30 +184,6 @@ credentials_copy(struct credentials *dst, struct credentials *src)
  */
 extern struct credentials admin_credentials;
 
-/**
- * Create a new session on demand, and set fiber on_stop
- * trigger to destroy it when this fiber ends.
- */
-struct session *
-session_create_on_demand();
-
-/*
- * When creating a new fiber, the database (box)
- * may not be initialized yet. When later on
- * this fiber attempts to access the database,
- * we have no other choice but initialize fiber-specific
- * database state (something like a database connection)
- * on demand. This is why this function needs to
- * check whether or not the current session exists
- * and create it otherwise.
- */
-static inline struct session *
-current_session()
-{
-	struct session *s = (struct session *)
-		fiber_get_key(fiber(), FIBER_KEY_SESSION);
-	return s ? s : session_create_on_demand();
-}
 
 /** Global on-disconnect triggers. */
 extern struct rlist session_on_disconnect;
@@ -156,22 +191,13 @@ extern struct rlist session_on_disconnect;
 void
 session_storage_cleanup(int sid);
 
-#if defined(__cplusplus)
-} /* extern "C" */
-
-/**
- * Create a session.
- * Invokes a Lua trigger box.session.on_connect if it is
- * defined. Issues a new session identifier.
- * Must called by the networking layer
- * when a new connection is established.
- *
- * @return handle for a created session
- * @exception tnt_Exception or lua error if session
- * trigger fails or runs out of resources.
- */
-struct session *
-session_create(int fd);
+static inline struct session *
+session_create_xc(int fd) {
+	struct session *s = session_create(fd);
+	if (s == NULL)
+		diag_raise();
+	return s;
+}
 
 /**
  * Destroy a session.
@@ -185,6 +211,21 @@ session_create(int fd);
 void
 session_destroy(struct session *);
 
+
+#if defined(__cplusplus)
+} /* extern "C" */
+
+static inline struct credentials *
+current_user_xc()
+{
+	struct credentials *cr = current_user();
+	if (cr == NULL) {
+		diag_raise();
+	}
+	return cr;
+
+}
+
 /** Run on-connect triggers */
 void
 session_run_on_connect_triggers(struct session *session);
@@ -196,37 +237,18 @@ session_run_on_disconnect_triggers(struct session *session);
 void
 session_run_on_auth_triggers(const char *user_name);
 
-/*
- * Return the current user. Create it if it doesn't
- * exist yet.
- * The same rationale for initializing the current
- * user on demand as in current_session() applies.
- */
-static inline struct credentials *
-current_user()
-{
-	struct credentials *u =
-		(struct credentials *) fiber_get_key(fiber(),
-						      FIBER_KEY_USER);
-	if (u == NULL) {
-		session_create_on_demand();
-		u = (struct credentials *) fiber_get_key(fiber(),
-							  FIBER_KEY_USER);
-	}
-	return u;
-}
 
 static inline void
 access_check_universe(uint8_t access)
 {
-	struct credentials *credentials = current_user();
-	if (!(credentials->universal_access & access)) {
+	struct credentials *cr = current_user_xc();
+	if (!(cr->universal_access & access)) {
 		/*
 		 * Access violation, report error.
 		 * The user may not exist already, if deleted
 		 * from a different connection.
 		 */
-		struct user *user = user_find_xc(credentials->uid);
+		struct user *user = user_find_xc(cr->uid);
 		tnt_raise(ClientError, ER_ACCESS_DENIED,
 			  priv_name(access), schema_object_name(SC_UNIVERSE),
 			  user->def.name);

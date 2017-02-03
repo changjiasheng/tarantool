@@ -74,7 +74,12 @@ struct session *
 session_create(int fd)
 {
 	struct session *session = (struct session *)
-		mempool_alloc_xc(&session_pool);
+		mempool_alloc(&session_pool);
+	if (session == NULL) {
+		diag_set(OutOfMemory, sizeof(struct session), "region",
+			 "new slab");
+		return NULL;
+	}
 	session->id = sid_max();
 	session->fd =  fd;
 	session->sync = 0;
@@ -90,7 +95,8 @@ session_create(int fd)
 
 	if (k == mh_end(session_registry)) {
 		mempool_free(&session_pool, session);
-		tnt_raise(OutOfMemory, 0, "session hash", "new session");
+		diag_set(OutOfMemory, 0, "session hash", "new session");
+		return NULL;
 	}
 	return session;
 }
@@ -100,6 +106,8 @@ session_create_on_demand()
 {
 	/* Create session on demand */
 	struct session *s = session_create(-1);
+	if (s == NULL)
+		return NULL;
 	s->fiber_on_stop = {
 		RLIST_LINK_INITIALIZER, session_on_stop, NULL, NULL
 	};

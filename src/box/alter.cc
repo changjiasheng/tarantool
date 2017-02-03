@@ -29,6 +29,7 @@
  * SUCH DAMAGE.
  */
 #include "alter.h"
+#include <stdint.h>
 #include "schema.h"
 #include "user.h"
 #include "space.h"
@@ -91,7 +92,7 @@
 void
 access_check_ddl(uint32_t owner_uid, enum schema_object_type type)
 {
-	struct credentials *cr = current_user();
+	struct credentials *cr = current_user_xc();
 	/*
 	 * Only the owner of the object can be the grantor
 	 * of the privilege on the object. This means that
@@ -1709,7 +1710,8 @@ user_cache_alter_user(struct trigger * /* trigger */, void *event)
 	struct txn_stmt *stmt = txn_last_stmt(txn);
 	struct user_def user;
 	user_def_create_from_tuple(&user, stmt->new_tuple);
-	user_cache_replace(&user);
+	if (user_cache_replace(&user) == NULL)
+		diag_raise();
 }
 
 /**
@@ -1730,7 +1732,8 @@ on_replace_dd_user(struct trigger * /* trigger */, void *event)
 	if (new_tuple != NULL && old_user == NULL) { /* INSERT */
 		struct user_def user;
 		user_def_create_from_tuple(&user, new_tuple);
-		(void) user_cache_replace(&user);
+		if (user_cache_replace(&user) == NULL)
+			diag_raise();
 		struct trigger *on_rollback =
 			txn_alter_trigger_new(user_cache_remove_user, NULL);
 		txn_on_rollback(txn, on_rollback);
@@ -1955,7 +1958,8 @@ priv_def_check(struct priv_def *priv)
 				  "Grant", role->def.name, grantor->def.name);
 		}
 		/* Not necessary to do during revoke, but who cares. */
-		role_check(grantee, role);
+		if (role_check(grantee, role) == -1)
+			diag_raise();
 	}
 	default:
 		break;
@@ -1976,17 +1980,20 @@ grant_or_revoke(struct priv_def *priv)
 	struct user *grantee = user_by_id(priv->grantee_id);
 	if (grantee == NULL)
 		return;
+	int status = 0;
 	if (priv->object_type == SC_ROLE) {
 		struct user *role = user_by_id(priv->object_id);
 		if (role == NULL || role->def.type != SC_ROLE)
 			return;
 		if (priv->access)
-			role_grant(grantee, role);
+			status = role_grant(grantee, role);
 		else
-			role_revoke(grantee, role);
+			status = role_revoke(grantee, role);
 	} else {
-		priv_grant(grantee, priv);
+		status = priv_grant(grantee, priv);
 	}
+	if (status == -1)
+		diag_raise();
 }
 
 /** A trigger called on rollback of grant, or on commit of revoke. */

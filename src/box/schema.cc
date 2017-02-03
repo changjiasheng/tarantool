@@ -28,6 +28,7 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+#include <stdint.h>
 #include "schema.h"
 #include "user_def.h"
 #include "engine.h"
@@ -74,7 +75,7 @@ space_is_system(struct space *space)
 }
 
 /** Return space by its number */
-extern "C" struct space *
+struct space *
 space_by_id(uint32_t id)
 {
 	mh_int_t space = mh_i32ptr_find(spaces, id, NULL);
@@ -83,7 +84,7 @@ space_by_id(uint32_t id)
 	return (struct space *) mh_i32ptr_node(spaces, space)->val;
 }
 
-extern "C" const char *
+const char *
 space_name_by_id(uint32_t id)
 {
 	struct space *space = space_by_id(id);
@@ -199,31 +200,42 @@ sc_space_new(struct space_def *space_def,
 	return space;
 }
 
-uint32_t
+int
 schema_find_id(uint32_t system_space_id, uint32_t index_id,
-	       const char *name, uint32_t len)
+	       const char *name, uint32_t len, uint32_t *out_id)
 {
-	struct space *space = space_cache_find(system_space_id);
-	MemtxIndex *index = index_find_system(space, index_id);
-	char buf[BOX_NAME_MAX * 2];
-	/**
-	 * This is an internal-only method, we should know the
-	 * max length in advance.
-	 */
-	if (len + 5 > sizeof(buf))
-		return BOX_ID_NIL;
+	struct iterator *it = NULL;
+	try {
+		*out_id = BOX_ID_NIL;
+		struct space *space = space_cache_find(system_space_id);
+		MemtxIndex *index = index_find_system(space, index_id);
+		char buf[BOX_NAME_MAX * 2];
+		/**
+		* This is an internal-only method, we should know the
+		* max length in advance.
+		*/
+		if (len + 5 > sizeof(buf)) {
+			return 0;
+		}
 
-	mp_encode_str(buf, name, len);
+		mp_encode_str(buf, name, len);
 
-	struct iterator *it = index->position();
-	index->initIterator(it, ITER_EQ, buf, 1);
+		it = index->position();
+		index->initIterator(it, ITER_EQ, buf, 1);
 
-	struct tuple *tuple = it->next(it);
-	if (tuple) {
-		/* id is always field #1 */
-		return tuple_field_u32_xc(tuple, 0);
+		struct tuple *tuple = it->next(it);
+		if (tuple) {
+			/* id is always field #1 */
+			*out_id = tuple_field_u32_xc(tuple, 0);
+			return 0;
+		}
+
+		return 0;
+	} catch (Exception *) {
+		if (it != NULL)
+			it->free(it);
+		return -1;
 	}
-	return BOX_ID_NIL;
 }
 
 /**

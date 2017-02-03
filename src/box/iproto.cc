@@ -1053,6 +1053,8 @@ tx_process_connect(struct cmsg *m)
 	struct obuf *out = &msg->iobuf->out;
 	try {              /* connect. */
 		con->session = session_create(con->input.fd);
+		if (con->session == NULL)
+			diag_raise();
 		static __thread char greeting[IPROTO_GREETING_SIZE];
 		/* TODO: dirty read from tx thread */
 		struct tt_uuid uuid = SERVER_UUID;
