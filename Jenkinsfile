@@ -1,14 +1,12 @@
 #!groovy
-node {
-    stage('Preparation') {
-        git branch: '1.7', url: 'https://github.com/tarantool/tarantool.git'
-        sh 'git submodule update'
-        dir("build") {
-            git 'https://github.com/tarantool/build.git'
-        }
-        stash name: 'source', useDefaultExcludes: false
+
+stage('Preparation') {
+    dir("build") {
+        git 'https://github.com/tarantool/build.git'
     }
+    stash name: 'source', useDefaultExcludes: false
 }
+
 
 stage('Build') {
     timeout(time: 2, unit: 'HOURS') {
