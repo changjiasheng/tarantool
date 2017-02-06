@@ -1484,6 +1484,27 @@ vy_index_unacct_range(struct vy_index *index, struct vy_range *range)
 	histogram_discard(index->run_hist, range->run_count);
 }
 
+/**
+ * Allocate a new run for an index and write the information
+ * about it to the metadata log so that we could still find and
+ * delete it in case a write error occured.
+ */
+static struct vy_run *
+vy_index_prepare_run(struct vy_index *index)
+{
+	struct vy_log *log = index->env->log;
+	struct vy_run *run = vy_run_new(vy_log_next_run_id(log));
+	if (run == NULL)
+		return NULL;
+	vy_log_tx_begin(log);
+	vy_log_prepare_run(log, index->key_def->opts.lsn, run->id);
+	if (vy_log_tx_commit(log) < 0) {
+		vy_run_delete(run);
+		return NULL;
+	}
+	return run;
+}
+
 /** An snprint-style function to print a range's boundaries. */
 static int
 vy_range_snprint(char *buf, int size, const struct vy_range *range)
@@ -3649,7 +3670,6 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	};
 
 	struct vy_index *index = range->index;
-	struct vy_log *log = index->env->log;
 	struct tx_manager *xm = index->env->xm;
 	struct lsregion *allocator = &index->env->allocator;
 	struct vy_scheduler *scheduler = index->env->scheduler;
@@ -3669,7 +3689,7 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	if (wi == NULL)
 		goto err_wi;
 
-	range->new_run = vy_run_new(vy_log_next_run_id(log));
+	range->new_run = vy_index_prepare_run(index);
 	if (range->new_run == NULL)
 		goto err_run;
 
@@ -3849,7 +3869,6 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 {
 	struct vy_index *index = range->index;
 	struct tx_manager *xm = index->env->xm;
-	struct vy_log *log = index->env->log;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 
 	assert(rlist_empty(&range->split_list));
@@ -3888,7 +3907,7 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 		r = parts[i] = vy_range_new(index, -1, keys[i], keys[i + 1]);
 		if (r == NULL)
 			goto err_parts;
-		r->new_run = vy_run_new(vy_log_next_run_id(log));
+		r->new_run = vy_index_prepare_run(index);
 		if (r->new_run == NULL)
 			goto err_parts;
 	}
@@ -4068,7 +4087,6 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	};
 
 	struct vy_index *index = range->index;
-	struct vy_log *log = index->env->log;
 	struct tx_manager *xm = index->env->xm;
 	struct lsregion *allocator = &index->env->allocator;
 	struct vy_scheduler *scheduler = index->env->scheduler;
@@ -4089,7 +4107,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	if (wi == NULL)
 		goto err_wi;
 
-	range->new_run = vy_run_new(vy_log_next_run_id(log));
+	range->new_run = vy_index_prepare_run(index);
 	if (range->new_run == NULL)
 		goto err_run;
 

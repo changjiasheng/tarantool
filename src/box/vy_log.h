@@ -91,6 +91,19 @@ enum vy_log_type {
 	 * Requires vy_log_record::run_id.
 	 */
 	VY_LOG_DELETE_RUN		= 5,
+	/**
+	 * Prepare a run file.
+	 * Requires vy_log_record::index_id, run_id.
+	 *
+	 * Record of this type is written before creating a run file.
+	 * It is needed to keep track of unfinished due to errors run
+	 * files so that we could remove them on snapshot.
+	 *
+	 * Note, it is not mandatory. The recovery procedure can handle
+	 * VY_LOG_INSERT_RUN w/o corresponding VY_LOG_PREPARE_RUN.
+	 * Records of this type are removed on log rotation.
+	 */
+	VY_LOG_PREPARE_RUN		= 6,
 
 	vy_log_MAX
 };
@@ -373,6 +386,18 @@ vy_log_delete_range(struct vy_log *log, int64_t range_id)
 	struct vy_log_record record = {
 		.type = VY_LOG_DELETE_RANGE,
 		.range_id = range_id,
+	};
+	vy_log_write(log, &record);
+}
+
+/** Helper to log a run file creation. */
+static inline void
+vy_log_prepare_run(struct vy_log *log, int64_t index_id, int64_t run_id)
+{
+	struct vy_log_record record = {
+		.type = VY_LOG_PREPARE_RUN,
+		.index_id = index_id,
+		.run_id = run_id,
 	};
 	vy_log_write(log, &record);
 }

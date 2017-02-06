@@ -95,6 +95,8 @@ static const unsigned long vy_log_key_mask[] = {
 	[VY_LOG_INSERT_RUN]		= (1 << VY_LOG_KEY_RANGE_ID) |
 					  (1 << VY_LOG_KEY_RUN_ID),
 	[VY_LOG_DELETE_RUN]		= (1 << VY_LOG_KEY_RUN_ID),
+	[VY_LOG_PREPARE_RUN]		= (1 << VY_LOG_KEY_INDEX_ID) |
+					  (1 << VY_LOG_KEY_RUN_ID),
 };
 
 /** vy_log_key -> human readable name. */
@@ -117,6 +119,7 @@ static const char *vy_log_type_name[] = {
 	[VY_LOG_DELETE_RANGE]		= "delete_range",
 	[VY_LOG_INSERT_RUN]		= "insert_run",
 	[VY_LOG_DELETE_RUN]		= "delete_run",
+	[VY_LOG_PREPARE_RUN]		= "prepare_run",
 };
 
 /** Recovery context. */
@@ -156,6 +159,12 @@ struct vy_index_recovery_info {
 	 * vy_range_recovery_info::in_index.
 	 */
 	struct rlist ranges;
+	/**
+	 * List of runs that were prepared (VY_LOG_PREPARE_RUN),
+	 * but were not inserted to a range (VY_LOG_INSERT_RUN),
+	 * linked by vy_run_recovery_info::in_incomplete.
+	 */
+	struct rlist incomplete_runs;
 };
 
 /** Range info stored in a recovery context. */
@@ -181,6 +190,8 @@ struct vy_range_recovery_info {
 struct vy_run_recovery_info {
 	/** Link in vy_range_recovery_info::runs. */
 	struct rlist in_range;
+	/** Link in vy_index_recovery_info::incomplete_runs. */
+	struct rlist in_incomplete;
 	/** ID of the run. */
 	int64_t id;
 };
@@ -1010,6 +1021,7 @@ vy_recovery_create_index(struct vy_recovery *recovery, int64_t index_id,
 	index->path[path_len] = '\0';
 	index->is_dropped = false;
 	rlist_create(&index->ranges);
+	rlist_create(&index->incomplete_runs);
 	return 0;
 }
 
@@ -1036,17 +1048,81 @@ vy_recovery_drop_index(struct vy_recovery *recovery, int64_t index_id)
 }
 
 /**
- * Handle a VY_LOG_INSERT_RUN log record.
+ * Allocate a run with ID @run_id and insert it to the hash.
+ * ID collisions are not resolved.
+ * Return the new run on success, NULL on OOM.
+ */
+static struct vy_run_recovery_info *
+vy_recovery_hash_run(struct vy_recovery *recovery, int64_t run_id)
+{
+	struct vy_run_recovery_info *run = malloc(sizeof(*run));
+	if (run == NULL) {
+		diag_set(OutOfMemory, sizeof(*run),
+			 "malloc", "struct vy_run_recovery_info");
+		return NULL;
+	}
+	struct mh_i64ptr_t *h = recovery->run_hash;
+	struct mh_i64ptr_node_t node = { run_id, run };
+	struct mh_i64ptr_node_t *old_node;
+	if (mh_i64ptr_put(h, &node, &old_node, NULL) == mh_end(h)) {
+		diag_set(OutOfMemory, 0, "mh_i64ptr_put", "mh_i64ptr_node_t");
+		free(run);
+		return NULL;
+	}
+	assert(old_node == NULL);
+	run->id = run_id;
+	rlist_create(&run->in_range);
+	rlist_create(&run->in_incomplete);
+	if (recovery->run_id_max < run_id)
+		recovery->run_id_max = run_id;
+	return run;
+}
+
+/**
+ * Handle a VY_LOG_PREPARE_RUN log record.
  * This function allocates a new run with ID @run_id, inserts it
- * to the hash, and adds it to the list of runs of the range with
- * ID @range_id.
+ * to the hash, and ads it to the list of incomplete runs of the
+ * index with ID @index_id.
+ * Return 0 on success, -1 on failure (ID collision or OOM).
+ */
+static int
+vy_recovery_prepare_run(struct vy_recovery *recovery,
+			int64_t index_id, int64_t run_id)
+{
+	if (vy_recovery_lookup_run(recovery, run_id) != NULL) {
+		diag_set(ClientError, ER_VINYL, "duplicate run id");
+		return -1;
+	}
+	struct vy_index_recovery_info *index;
+	index = vy_recovery_lookup_index(recovery, index_id);
+	if (index == NULL) {
+		diag_set(ClientError, ER_VINYL, "unknown index id");
+		return -1;
+	}
+	struct vy_run_recovery_info *run;
+	run = vy_recovery_hash_run(recovery, run_id);
+	if (run == NULL)
+		return -1;
+	rlist_add_entry(&index->incomplete_runs, run, in_incomplete);
+	return 0;
+}
+
+/**
+ * Handle a VY_LOG_INSERT_RUN log record.
+ * This function either moves the existing run with ID @run_id from
+ * the index's list of incomplete runs to the list of runs of the
+ * range with ID @range_id, or if the run with ID @run_id doesn't
+ * exist, allocates a new run with ID @run_id, inserts it to the hash,
+ * and adds it to the list of runs of the range with ID @range_id.
  * Return 0 on success, -1 on failure (ID collision or OOM).
  */
 static int
 vy_recovery_insert_run(struct vy_recovery *recovery,
 		       int64_t range_id, int64_t run_id)
 {
-	if (vy_recovery_lookup_run(recovery, run_id) != NULL) {
+	struct vy_run_recovery_info *run;
+	run = vy_recovery_lookup_run(recovery, run_id);
+	if (run != NULL && !rlist_empty(&run->in_range)) {
 		diag_set(ClientError, ER_VINYL, "duplicate run id");
 		return -1;
 	}
@@ -1056,23 +1132,15 @@ vy_recovery_insert_run(struct vy_recovery *recovery,
 		diag_set(ClientError, ER_VINYL, "unknown range id");
 		return -1;
 	}
-	struct vy_run_recovery_info *run = malloc(sizeof(*run));
 	if (run == NULL) {
-		diag_set(OutOfMemory, sizeof(*run),
-			 "malloc", "struct vy_run_recovery_info");
-		return -1;
+		run = vy_recovery_hash_run(recovery, run_id);
+		if (run == NULL)
+			return -1;
+	} else {
+		assert(!rlist_empty(&run->in_incomplete));
+		rlist_del(&run->in_incomplete);
 	}
-	struct mh_i64ptr_t *h = recovery->run_hash;
-	struct mh_i64ptr_node_t node = { run_id, run };
-	if (mh_i64ptr_put(h, &node, NULL, NULL) == mh_end(h)) {
-		diag_set(OutOfMemory, 0, "mh_i64ptr_put", "mh_i64ptr_node_t");
-		free(run);
-		return -1;
-	}
-	run->id = run_id;
 	rlist_add_entry(&range->runs, run, in_range);
-	if (recovery->run_id_max < run_id)
-		recovery->run_id_max = run_id;
 	return 0;
 }
 
@@ -1223,6 +1291,10 @@ vy_recovery_process_record(struct vy_recovery *recovery,
 		break;
 	case VY_LOG_DELETE_RUN:
 		rc = vy_recovery_delete_run(recovery, record->run_id);
+		break;
+	case VY_LOG_PREPARE_RUN:
+		rc = vy_recovery_prepare_run(recovery, record->index_id,
+					     record->run_id);
 		break;
 	default:
 		unreachable();
