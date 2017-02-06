@@ -31,6 +31,8 @@
  * SUCH DAMAGE.
  */
 
+#include <pmatomic.h>
+
 #include "key_def.h" /* for enum field_type */
 #include "errinj.h"
 
@@ -172,7 +174,7 @@ tuple_format_ref(struct tuple_format *format, int count)
 	assert(format->refs + count >= 0);
 	assert((uint64_t)format->refs + count <= FORMAT_REF_MAX);
 
-	format->refs += count;
+	pm_atomic_fetch_add(&format->refs, count);
 	if (format->refs == 0)
 		tuple_format_delete(format);
 
