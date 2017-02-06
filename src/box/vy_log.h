@@ -105,6 +105,15 @@ enum vy_log_type {
 	 */
 	VY_LOG_PREPARE_RUN		= 6,
 
+	/**
+	 * Special record that is only written on log rotation if we
+	 * fail to delete a run file. It contains the information
+	 * necessary to retry garbage collection later.
+	 *
+	 * Requires vy_log_record::run_id, iid, space_id, path, path_len.
+	 */
+	VY_LOG_GC			= 7,
+
 	vy_log_MAX
 };
 
@@ -215,6 +224,10 @@ vy_log_create(struct vy_log *log);
 void
 vy_log_delete(struct vy_log *log);
 
+typedef int
+(*vy_log_gc_cb)(int64_t run_id, uint32_t iid, uint32_t space_id,
+		const char *path, void *arg);
+
 /**
  * Rotate vinyl metadata log @log. This function creates a new
  * xlog file in the log directory having signature @signature
@@ -223,10 +236,19 @@ vy_log_delete(struct vy_log *log);
  * discarding records cancelling each other and records left
  * from dropped indexes.
  *
+ * The function calls @gc_cb for each deleted run, passing info
+ * necessary to lookup its files and optional argument @gc_arg.
+ * The callback is supposed to unlink files left from deleted
+ * runs and return 0 on success, != 0 on failure. For each run
+ * whose files the callback failed to delete, a VY_LOG_GC record
+ * will be written to the log. It will be used to retry deletion
+ * next time the log is rotated.
+ *
  * Returns 0 on success, -1 on failure.
  */
 int
-vy_log_rotate(struct vy_log *log, int64_t signature);
+vy_log_rotate(struct vy_log *log, int64_t signature,
+	      vy_log_gc_cb gc_cb, void *gc_arg);
 
 /** Allocate a unique ID for a run. */
 static inline int64_t

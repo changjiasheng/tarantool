@@ -1394,6 +1394,14 @@ static const char *vy_file_suffix[] = {
 #define XLOG_META_TYPE_INDEX "INDEX"
 
 static int
+vy_index_snprint_path(char *buf, size_t size, const char *dir,
+		      uint32_t space_id, uint32_t iid)
+{
+	return snprintf(buf, size, "%s/%u/%u",
+			dir, (unsigned)space_id, (unsigned)iid);
+}
+
+static int
 vy_run_snprint_path(char *buf, size_t size, const char *dir,
 		    int64_t run_id, enum vy_file_type type)
 {
@@ -1409,19 +1417,31 @@ vy_run_snprint_path(char *buf, size_t size, const char *dir,
  * means that it cannot be used on shutdown, because the event loop
  * is unavailable at that time.
  */
-static void
+static int
 vy_run_unlink_files(const char *dir, int64_t run_id)
 {
+	bool success = true;
 	char path[PATH_MAX];
 	for (int type = 0; type < vy_file_MAX; type++) {
+		bool delete = true;
 		vy_run_snprint_path(path, PATH_MAX, dir, run_id, type);
 		ERROR_INJECT(ERRINJ_VY_GC,
 			     {say_error("file '%s' was not deleted "
 					"due to error injection", path);
-			      continue;});
-		if (coeio_unlink(path) < 0 && errno != ENOENT)
-			say_syserror("failed to delete file '%s'", path);
+			      success = delete = false;});
+		if (delete) {
+			int rc;
+			if (cord_is_main())
+				rc = coeio_unlink(path);
+			else
+				rc = unlink(path);
+			if (rc < 0 && errno != ENOENT) {
+				say_syserror("failed to delete file '%s'", path);
+				success = false;
+			}
+		}
 	}
+	return success ? 0 : -1;
 }
 
 static void
@@ -4769,6 +4789,21 @@ vy_checkpoint(struct vy_env *env)
 	return 0;
 }
 
+/** Garbage collection callback. Passed to vy_log_rotate(). */
+static int
+vy_run_gc_cb(int64_t run_id, uint32_t iid, uint32_t space_id,
+	     const char *path, void *arg)
+{
+	struct vy_env *env = arg;
+	char buf[PATH_MAX];
+	if (path[0] == '\0') {
+		vy_index_snprint_path(buf, sizeof(buf),
+				      env->conf->path, space_id, iid);
+		path = buf;
+	}
+	return vy_run_unlink_files(path, run_id);
+}
+
 int
 vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 {
@@ -4784,7 +4819,8 @@ vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 		return -1;
 	}
 
-	if (vy_log_rotate(env->log, vclock_sum(vclock)) != 0)
+	if (vy_log_rotate(env->log, vclock_sum(vclock),
+			  vy_run_gc_cb, env) != 0)
 		return -1;
 
 	return 0;
@@ -5037,9 +5073,8 @@ vy_index_conf_create(struct vy_index *conf, struct key_def *key_def)
 	/* path */
 	if (key_def->opts.path[0] == '\0') {
 		char path[PATH_MAX];
-		snprintf(path, sizeof(path), "%s/%" PRIu32 "/%" PRIu32,
-			 cfg_gets("vinyl_dir"), key_def->space_id,
-			 key_def->iid);
+		vy_index_snprint_path(path, sizeof(path), conf->env->conf->path,
+				      key_def->space_id, key_def->iid);
 		conf->path = strdup(path);
 	} else {
 		conf->path = strdup(key_def->opts.path);

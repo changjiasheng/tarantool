@@ -97,6 +97,10 @@ static const unsigned long vy_log_key_mask[] = {
 	[VY_LOG_DELETE_RUN]		= (1 << VY_LOG_KEY_RUN_ID),
 	[VY_LOG_PREPARE_RUN]		= (1 << VY_LOG_KEY_INDEX_ID) |
 					  (1 << VY_LOG_KEY_RUN_ID),
+	[VY_LOG_GC]			= (1 << VY_LOG_KEY_RUN_ID) |
+					  (1 << VY_LOG_KEY_IID) |
+					  (1 << VY_LOG_KEY_SPACE_ID) |
+					  (1 << VY_LOG_KEY_PATH),
 };
 
 /** vy_log_key -> human readable name. */
@@ -120,6 +124,7 @@ static const char *vy_log_type_name[] = {
 	[VY_LOG_INSERT_RUN]		= "insert_run",
 	[VY_LOG_DELETE_RUN]		= "delete_run",
 	[VY_LOG_PREPARE_RUN]		= "prepare_run",
+	[VY_LOG_GC]			= "gc",
 };
 
 /** Recovery context. */
@@ -130,6 +135,15 @@ struct vy_recovery {
 	struct mh_i64ptr_t *range_hash;
 	/** ID -> vy_run_recovery_info. */
 	struct mh_i64ptr_t *run_hash;
+	/**
+	 * List of runs whose files we failed to delete.
+	 * Linked by vy_run_gc_info::in_gc.
+	 */
+	struct rlist gc_list;
+	/** Garbage collection callback. */
+	vy_log_gc_cb gc_cb;
+	/** Argument to the garbage collection callback. */
+	void *gc_arg;
 	/**
 	 * Maximal range ID, according to the metadata log,
 	 * or -1 in case no ranges were recovered.
@@ -171,6 +185,8 @@ struct vy_index_recovery_info {
 struct vy_range_recovery_info {
 	/** Link in vy_index_recovery_info::ranges. */
 	struct rlist in_index;
+	/** Index this range belongs to. */
+	struct vy_index_recovery_info *index;
 	/** ID of the range. */
 	int64_t id;
 	/** Start of the range, stored in MsgPack array. */
@@ -192,12 +208,29 @@ struct vy_run_recovery_info {
 	struct rlist in_range;
 	/** Link in vy_index_recovery_info::incomplete_runs. */
 	struct rlist in_incomplete;
+	/** Index this run belongs to. */
+	struct vy_index_recovery_info *index;
 	/** ID of the run. */
 	int64_t id;
 };
 
+/** Info necessary to delete a run's files. */
+struct vy_run_gc_info {
+	/** ID of the run. */
+	int64_t run_id;
+	/** Ordinal index number in the space. */
+	uint32_t iid;
+	/** Space ID. */
+	uint32_t space_id;
+	/** Path to the index. Empty string if default. */
+	char *path;
+	/** Link in vy_recovery::gc_list. */
+	struct rlist in_gc;
+};
+
 static struct vy_recovery *
-vy_recovery_new(const char *dir, int64_t signature);
+vy_recovery_new(const char *dir, int64_t signature,
+		vy_log_gc_cb gc_cb, void *gc_arg);
 static void
 vy_recovery_delete(struct vy_recovery *recovery);
 static int
@@ -710,7 +743,8 @@ vy_log_begin_recovery(struct vy_log *log, int64_t signature)
 	assert(log->xlog == NULL);
 	assert(log->recovery == NULL);
 
-	struct vy_recovery *recovery = vy_recovery_new(log->dir, signature);
+	struct vy_recovery *recovery = vy_recovery_new(log->dir, signature,
+						       NULL, NULL);
 	if (recovery == NULL)
 		return -1;
 
@@ -763,8 +797,11 @@ vy_log_rotate_f(va_list ap)
 	const char *dir = va_arg(ap, const char *);
 	int64_t old_signature = va_arg(ap, int64_t);
 	int64_t new_signature = va_arg(ap, int64_t);
+	vy_log_gc_cb gc_cb = va_arg(ap, vy_log_gc_cb);
+	void *gc_arg = va_arg(ap, void *);
 
-	struct vy_recovery *recovery = vy_recovery_new(dir, old_signature);
+	struct vy_recovery *recovery = vy_recovery_new(dir, old_signature,
+						       gc_cb, gc_arg);
 	if (recovery == NULL)
 		goto err_recovery;
 
@@ -801,7 +838,8 @@ err_recovery:
 }
 
 int
-vy_log_rotate(struct vy_log *log, int64_t signature)
+vy_log_rotate(struct vy_log *log, int64_t signature,
+	      vy_log_gc_cb gc_cb, void *gc_arg)
 {
 	assert(log->xlog != NULL);
 
@@ -836,7 +874,7 @@ vy_log_rotate(struct vy_log *log, int64_t signature)
 	}
 	/* Do actual work from coeio so as not to stall tx thread. */
 	if (coio_call(vy_log_rotate_f, log->dir,
-		      log->signature, signature) < 0) {
+		      log->signature, signature, gc_cb, gc_arg) < 0) {
 		latch_unlock(log->latch);
 		goto err_rotate;
 	}
@@ -1070,6 +1108,7 @@ vy_recovery_hash_run(struct vy_recovery *recovery, int64_t run_id)
 		return NULL;
 	}
 	assert(old_node == NULL);
+	run->index = NULL;
 	run->id = run_id;
 	rlist_create(&run->in_range);
 	rlist_create(&run->in_incomplete);
@@ -1103,6 +1142,7 @@ vy_recovery_prepare_run(struct vy_recovery *recovery,
 	run = vy_recovery_hash_run(recovery, run_id);
 	if (run == NULL)
 		return -1;
+	run->index = index;
 	rlist_add_entry(&index->incomplete_runs, run, in_incomplete);
 	return 0;
 }
@@ -1136,7 +1176,9 @@ vy_recovery_insert_run(struct vy_recovery *recovery,
 		run = vy_recovery_hash_run(recovery, run_id);
 		if (run == NULL)
 			return -1;
+		run->index = range->index;
 	} else {
+		assert(run->index == range->index);
 		assert(!rlist_empty(&run->in_incomplete));
 		rlist_del(&run->in_incomplete);
 	}
@@ -1145,9 +1187,66 @@ vy_recovery_insert_run(struct vy_recovery *recovery,
 }
 
 /**
+ * Handle a VY_LOG_GC log record.
+ * If garbage collection callback is available, call it to delete
+ * run files. If it fails, add an object containing information
+ * necessary for run deletion to the recovery->gc_list to retry
+ * deletion later.
+ * Returns 0 on success, -1 on OOM.
+ */
+static int
+vy_recovery_gc(struct vy_recovery *recovery, int64_t run_id, uint32_t iid,
+	       uint32_t space_id, const char *path_raw, uint32_t path_len)
+{
+	if (recovery->gc_cb == NULL) {
+		/* Garbage collection is disabled, nothing to do. */
+		return 0;
+	}
+	char *path = strndup(path_raw, path_len);
+	if (path == NULL) {
+		diag_set(OutOfMemory, path_len, "malloc", "path");
+		return -1;
+	}
+	if (recovery->gc_cb(run_id, iid, space_id, path,
+			    recovery->gc_arg) == 0) {
+		/* Garbage collection succeeded, we are done. */
+		free(path);
+		return 0;
+	}
+	/*
+	 * Garbage collection failed. Create an object containing
+	 * all the information necessary for run deletion.
+	 */
+	struct vy_run_gc_info *gc_info = malloc(sizeof(*gc_info));
+	if (gc_info == NULL) {
+		diag_set(OutOfMemory, sizeof(*gc_info),
+			 "malloc", "struct vy_run_gc_info");
+		free(path);
+		return -1;
+	}
+	gc_info->run_id = run_id;
+	gc_info->iid = iid;
+	gc_info->space_id = space_id;
+	gc_info->path = path;
+	rlist_add_entry(&recovery->gc_list, gc_info, in_gc);
+	return 0;
+}
+
+/** Wrapper around vy_recovery_gc() for invoking gc callback on a run. */
+static int
+vy_recovery_gc_run(struct vy_recovery *recovery,
+		   struct vy_run_recovery_info *run)
+{
+	struct vy_index_recovery_info *index = run->index;
+	return vy_recovery_gc(recovery, run->id, index->iid, index->space_id,
+			      index->path, strlen(index->path));
+}
+
+/**
  * Handle a VY_LOG_DELETE_RUN log record.
  * This function deletes the run with ID @run_id from the hash
- * and from the range's list and frees it.
+ * and from the range's list and frees it. It also attempts to
+ * delete run files and saves gc info on failure.
  * Return 0 on success, -1 if ID not found.
  */
 static int
@@ -1160,6 +1259,8 @@ vy_recovery_delete_run(struct vy_recovery *recovery, int64_t run_id)
 		return -1;
 	}
 	struct vy_run_recovery_info *run = mh_i64ptr_node(h, k)->val;
+	if (vy_recovery_gc_run(recovery, run) < 0)
+		return -1;
 	mh_i64ptr_del(h, k, NULL);
 	rlist_del_entry(run, in_range);
 	free(run);
@@ -1213,6 +1314,7 @@ vy_recovery_insert_range(struct vy_recovery *recovery,
 		free(range);
 		return -1;
 	}
+	range->index = index;
 	range->id = range_id;
 	range->begin = (void *)range + sizeof(*range);
 	memcpy(range->begin, begin, begin_size);
@@ -1296,10 +1398,43 @@ vy_recovery_process_record(struct vy_recovery *recovery,
 		rc = vy_recovery_prepare_run(recovery, record->index_id,
 					     record->run_id);
 		break;
+	case VY_LOG_GC:
+		rc = vy_recovery_gc(recovery, record->run_id,
+				    record->iid, record->space_id,
+				    record->path, record->path_len);
+		break;
 	default:
 		unreachable();
 	}
 	return rc;
+}
+
+/**
+ * If the given index is dropped, invoke the garbage collection
+ * callback on all its runs, otherwise invoke it only on incomplete
+ * runs.
+ * Return 0 on success, -1 on OOM.
+ */
+static int
+vy_recovery_gc_index(struct vy_recovery *recovery,
+		     struct vy_index_recovery_info *index)
+{
+	struct vy_range_recovery_info *range;
+	struct vy_run_recovery_info *run;
+
+	rlist_foreach_entry(run, &index->incomplete_runs, in_incomplete) {
+		if (vy_recovery_gc_run(recovery, run) < 0)
+			return -1;
+	}
+	if (index->is_dropped) {
+		rlist_foreach_entry(range, &index->ranges, in_index) {
+			rlist_foreach_entry(run, &range->runs, in_range) {
+				if (vy_recovery_gc_run(recovery, run) < 0)
+					return -1;
+			}
+		}
+	}
+	return 0;
 }
 
 /**
@@ -1308,10 +1443,15 @@ vy_recovery_process_record(struct vy_recovery *recovery,
  * that can be further used for recovering vinyl indexes with
  * vy_recovery_load_index().
  *
+ * If set, @gc_cb will be called on each deleted or incomplete
+ * run. It is supposed to delete run files. For more details,
+ * see the comment to vy_log_rotate().
+ *
  * Returns NULL on failure.
  */
 static struct vy_recovery *
-vy_recovery_new(const char *dir, int64_t signature)
+vy_recovery_new(const char *dir, int64_t signature,
+		vy_log_gc_cb gc_cb, void *gc_arg)
 {
 	struct vy_recovery *recovery = malloc(sizeof(*recovery));
 	if (recovery == NULL) {
@@ -1323,6 +1463,9 @@ vy_recovery_new(const char *dir, int64_t signature)
 	recovery->index_hash = NULL;
 	recovery->range_hash = NULL;
 	recovery->run_hash = NULL;
+	rlist_create(&recovery->gc_list);
+	recovery->gc_cb = gc_cb;
+	recovery->gc_arg = gc_arg;
 	recovery->range_id_max = -1;
 	recovery->run_id_max = -1;
 
@@ -1365,6 +1508,17 @@ vy_recovery_new(const char *dir, int64_t signature)
 		goto fail_close;
 
 	xlog_cursor_close(&cursor, false);
+
+	/* Delete files left from dropped indexes and incomplete runs. */
+	if (recovery->gc_cb != NULL) {
+		mh_int_t i;
+		mh_foreach(recovery->index_hash, i) {
+			struct vy_index_recovery_info *index;
+			index = mh_i64ptr_node(recovery->index_hash, i)->val;
+			if (vy_recovery_gc_index(recovery, index) != 0)
+				goto fail_free;
+		}
+	}
 out:
 	return recovery;
 
@@ -1390,6 +1544,11 @@ vy_recovery_delete_hash(struct mh_i64ptr_t *h)
 static void
 vy_recovery_delete(struct vy_recovery *recovery)
 {
+	struct vy_run_gc_info *it, *tmp;
+	rlist_foreach_entry_safe(it, &recovery->gc_list, in_gc, tmp) {
+		free(it->path);
+		free(it);
+	}
 	if (recovery->index_hash != NULL)
 		vy_recovery_delete_hash(recovery->index_hash);
 	if (recovery->range_hash != NULL)
@@ -1481,6 +1640,7 @@ static int
 vy_recovery_replay(struct vy_recovery *recovery,
 		   vy_recovery_cb cb, void *cb_arg)
 {
+	/* Active indexes, their ranges, and runs. */
 	mh_int_t i;
 	mh_foreach(recovery->index_hash, i) {
 		struct vy_index_recovery_info *index;
@@ -1488,6 +1648,21 @@ vy_recovery_replay(struct vy_recovery *recovery,
 		if (index->is_dropped)
 			continue;
 		if (vy_recovery_load_index(index, cb, cb_arg) < 0)
+			return -1;
+	}
+	/* Info about runs whose files we failed to delete. */
+	struct vy_run_gc_info *gc_info;
+	rlist_foreach_entry(gc_info, &recovery->gc_list, in_gc) {
+		struct vy_log_record record = {
+			.type = VY_LOG_GC,
+			.run_id = gc_info->run_id,
+			.iid = gc_info->iid,
+			.space_id = gc_info->space_id,
+			.path = gc_info->path,
+			.path_len = strlen(gc_info->path),
+		};
+		say_debug("%s: %s", __func__, vy_log_record_str(&record));
+		if (cb(&record, cb_arg) != 0)
 			return -1;
 	}
 	return 0;
